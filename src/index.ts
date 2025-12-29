@@ -79,7 +79,7 @@ function extractColumn(rows: string[][], selector: string): string[] {
   const endRow = match[4] ? Number(match[4]) : null;
 
   const colIndex = columnToIndex(column);
-  const segments: string[] = [];
+  const segments: { segment: string }[] = [];
 
   let emptyStreak = 0;
 
@@ -115,7 +115,7 @@ function extractRows(rows: string[][], selector: string): string[] {
     const row = rows[i] || [];
     for (const cell of row) {
       if (cell && cell.trim() !== "") {
-        segments.push(cell.trim());
+        segments.push({ segment: cell.trim() });
       }
     }
   }
