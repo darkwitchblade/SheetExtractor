@@ -1,196 +1,93 @@
+import { parseCSV } from './csv';
+import { extractSegments, parseSelector, type Selector } from './extract';
+import { buildCsvUrl, extractGid, extractSheetId } from './sheets';
+
 export default {
-  async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") {
-      return json({ error: "POST only" }, 405);
-    }
+	async fetch(request): Promise<Response> {
+		try {
+			return await handle(request);
+		} catch (err) {
+			console.error(err);
+			return json({ error: 'Internal error' }, 500);
+		}
+	},
+} satisfies ExportedHandler;
 
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON body" }, 400);
-    }
+async function handle(request: Request): Promise<Response> {
+	if (request.method !== 'POST') {
+		return json({ error: 'POST only' }, 405);
+	}
 
-    const { google_sheet_url, cell_selector, sheet_name } = body;
+	let body: unknown;
+	try {
+		body = await request.json();
+	} catch {
+		return json({ error: 'Invalid JSON body' }, 400);
+	}
+	if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+		return json({ error: 'JSON body must be an object' }, 400);
+	}
 
-    if (!google_sheet_url || !cell_selector) {
-      return json(
-        { error: "google_sheet_url and cell_selector are required" },
-        400
-      );
-    }
+	const { google_sheet_url, cell_selector, sheet_name } = body as Record<string, unknown>;
 
-    const warnings: string[] = [];
+	if (typeof google_sheet_url !== 'string' || typeof cell_selector !== 'string' || !google_sheet_url || !cell_selector) {
+		return json({ error: 'google_sheet_url and cell_selector are required strings' }, 400);
+	}
+	// Automation tools often send unmapped optional fields as "" or null.
+	if (sheet_name != null && typeof sheet_name !== 'string') {
+		return json({ error: 'sheet_name must be a string' }, 400);
+	}
+	const sheetName = sheet_name?.trim() || undefined;
 
-    const sheetId = extractSheetId(google_sheet_url);
-    const gid = extractGid(google_sheet_url);
-    if (!gid) {
-      warnings.push(
-        "No gid found in URL, defaulting to first sheet"
-      );
-    }
+	let sheetId: string;
+	let selector: Selector;
+	try {
+		sheetId = extractSheetId(google_sheet_url);
+		selector = parseSelector(cell_selector);
+	} catch (err) {
+		return json({ error: (err as Error).message }, 400);
+	}
 
-    const csvUrl = buildCsvUrl(sheetId, gid, sheet_name);
+	const warnings: string[] = [];
 
-    const csvRes = await fetch(csvUrl);
-    if (!csvRes.ok) {
-      return json(
-        { error: "Failed to fetch sheet (check sheet name or permissions)" },
-        400
-      );
-    }
+	const gid = extractGid(google_sheet_url);
+	if (!gid && !sheetName) {
+		warnings.push('No gid found in URL and no sheet_name given, defaulting to first sheet');
+	}
 
-    const csvText = await csvRes.text();
-    const rows = parseCSV(csvText);
+	let csvRes: Response;
+	try {
+		csvRes = await fetch(buildCsvUrl(sheetId, gid, sheetName));
+	} catch {
+		return json({ error: 'Could not reach Google Sheets' }, 502);
+	}
 
-    let segments: string[] = [];
+	if (!csvRes.ok) {
+		return json({ error: `Failed to fetch sheet (HTTP ${csvRes.status}); check the URL, gid and sheet_name` }, 400);
+	}
+	// Sheets that aren't shared publicly redirect to a Google sign-in page rather than failing.
+	if (csvRes.headers.get('Content-Type')?.includes('text/html')) {
+		return json({ error: 'Sheet is not public; share it as "Anyone with the link can view"' }, 400);
+	}
 
-    try {
-      if (cell_selector.toUpperCase().startsWith("ROW:")) {
-        segments = extractRows(rows, cell_selector);
-      } else {
-        segments = extractColumn(rows, cell_selector);
-      }
-    } catch (err: any) {
-      return json({ error: err.message }, 400);
-    }
+	const rows = parseCSV(await csvRes.text());
+	const segments = extractSegments(rows, selector);
 
-    if (segments.length === 0) {
-      warnings.push("No segments found for given selector");
-    }
+	if (segments.length === 0) {
+		warnings.push('No segments found for given selector');
+	}
 
-    return json({
-      status: "ok",
-      segment_count: segments.length,
-      segments,
-      warnings
-    });
-  }
-};
-
-/* -------------------- EXTRACTION -------------------- */
-
-function extractColumn(rows: string[][], selector: string): string[] {
-  const match = selector.match(/^([A-Z]+)(\d+)?(?::([A-Z]+)?(\d+)?)?$/i);
-  if (!match) throw new Error("Invalid column selector format");
-
-  const column = match[1].toUpperCase();
-  const startRow = match[2] ? Number(match[2]) : 1;
-  const endRow = match[4] ? Number(match[4]) : null;
-
-  const colIndex = columnToIndex(column);
-  const segments: { segment: string }[] = [];
-
-  let emptyStreak = 0;
-
-  for (let i = startRow - 1; i < rows.length; i++) {
-    if (endRow && i + 1 > endRow) break;
-
-    const cell = rows[i]?.[colIndex];
-    if (!cell || cell.trim() === "") {
-      emptyStreak++;
-      if (emptyStreak >= 2) break;
-      continue;
-    }
-
-    emptyStreak = 0;
-    segments.push(cell.trim());
-  }
-
-  return segments;
+	return json({
+		status: 'ok',
+		segment_count: segments.length,
+		segments,
+		warnings,
+	});
 }
 
-function extractRows(rows: string[][], selector: string): string[] {
-  const match = selector.match(/^ROW:(\d+)(?::(\d+))?$/i);
-  if (!match) throw new Error("Invalid ROW selector format");
-
-  const startRow = Number(match[1]);
-  const endRow = match[2] ? Number(match[2]) : startRow;
-
-  const segments: string[] = [];
-
-  for (let i = startRow - 1; i < rows.length; i++) {
-    if (i + 1 > endRow) break;
-
-    const row = rows[i] || [];
-    for (const cell of row) {
-      if (cell && cell.trim() !== "") {
-        segments.push({ segment: cell.trim() });
-      }
-    }
-  }
-
-  return segments;
-}
-
-/* -------------------- HELPERS -------------------- */
-
-function extractSheetId(url: string): string {
-  const id = url.match(/\/d\/([^/]+)/)?.[1];
-  if (!id) throw new Error("Invalid Google Sheets URL");
-  return id;
-}
-
-function extractGid(url: string): string | null {
-  return url.match(/gid=(\d+)/)?.[1] || null;
-}
-
-function buildCsvUrl(sheetId: string, gid: string | null, sheetName?: string) {
-  if (sheetName) {
-    return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&sheet=${encodeURIComponent(
-      sheetName
-    )}`;
-  }
-  if (gid) {
-    return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`;
-  }
-  return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`;
-}
-
-function columnToIndex(col: string): number {
-  let index = 0;
-  for (let i = 0; i < col.length; i++) {
-    index = index * 26 + (col.charCodeAt(i) - 64);
-  }
-  return index - 1;
-}
-
-function parseCSV(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    const next = text[i + 1];
-
-    if (char === '"' && next === '"') {
-      cell += '"';
-      i++;
-    } else if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === "," && !inQuotes) {
-      row.push(cell);
-      cell = "";
-    } else if (char === "\n" && !inQuotes) {
-      row.push(cell);
-      rows.push(row);
-      row = [];
-      cell = "";
-    } else {
-      cell += char;
-    }
-  }
-
-  row.push(cell);
-  rows.push(row);
-  return rows;
-}
-
-function json(data: any, status = 200): Response {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { "Content-Type": "application/json" }
-  });
+function json(data: unknown, status = 200): Response {
+	return new Response(JSON.stringify(data, null, 2), {
+		status,
+		headers: { 'Content-Type': 'application/json' },
+	});
 }
